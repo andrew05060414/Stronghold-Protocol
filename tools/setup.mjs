@@ -122,6 +122,48 @@ function saveState(patch) {
   } catch { /* best effort */ }
 }
 
+/** Ask for a free-text answer on a TTY. Non-TTY → null; an empty answer → ''. */
+async function askText(question) {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) return null;
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    return await new Promise((resolve) => rl.question(`  ${question} `, (a) => resolve(String(a || '').trim().replace(/^["']|["']$/g, ''))));
+  } finally {
+    rl.close();
+  }
+}
+
+let clientLookup = null;
+/**
+ * The local client for this run (memoised: steps 6 and 7 share it). When nothing is found and a terminal is
+ * attached, ask once for the install folder; the answer is remembered in setup-state.json (`clientPath`), and an
+ * empty answer is remembered as `clientDeclined` so setup stops asking (--game still works).
+ */
+function locateClient(explicit, { yes = false } = {}) {
+  if (!clientLookup) clientLookup = (async () => {
+    const found = findClient(explicit);
+    if (found?.autochess || explicit || yes) return found;
+    if (!process.stdin.isTTY || !process.stdout.isTTY) return found;
+    if (loadState().clientDeclined) return found;
+    console.log(`\n${c.cyan('▶')} 没有找到可用的明日方舟客户端（已查看常见安装位置和上次记住的路径；不扫描磁盘）。`);
+    console.log('  若游戏装在别处，请输入安装目录（里面有 Arknights.exe 的文件夹，例如 D:\\模拟器\\Arknights Game），也可以直接输入 Arknights_Data\\StreamingAssets\\AB\\Windows。');
+    console.log(c.dim('  直接回车跳过；跳过后不再询问，之后可用 --game <目录> 指定，或设置环境变量 SP_ARKNIGHTS_AB。'));
+    const typed = await askText('客户端安装目录：');
+    if (typed === null) return found;
+    if (!typed) { saveState({ clientDeclined: true }); return found; }
+    const root = resolveAbRoot(typed);
+    const info = inspectClientRoot(root);
+    if (info.exists && info.autochess) {
+      saveState({ clientPath: root });
+      console.log(`  ${c.ok('✔')} 已记住：${root}`);
+      return { path: root, kind: '手动输入', ...info };
+    }
+    console.log(`  ${c.warn('!')} ${typed} 里没有找到卫戍协议需要的美术（${info.exists ? '缺少 ui/autochess 或 arts/maps/map_autochess，请在游戏内下载全部资源' : '路径不存在'}）。`);
+    return found;
+  })();
+  return clientLookup;
+}
+
 /** Ask a yes/no question on a TTY (default on Enter / timeout = `def`). Non-TTY → null (nobody to ask). */
 async function ask(question, def, timeoutMs = 60000) {
   if (!process.stdin.isTTY || !process.stdout.isTTY) return null;
@@ -291,6 +333,20 @@ function cropBoardTiles(log) {
 
 const AB_TAIL = ['Arknights_Data', 'StreamingAssets', 'AB', 'Windows'];
 
+/**
+ * Accept an install folder (…\Arknights Game, holding Arknights.exe), its Arknights_Data folder or the AssetBundle
+ * root itself; return the AssetBundle root (or the input as given when none of the layouts exists).
+ */
+export function resolveAbRoot(p) {
+  if (!p) return null;
+  const abs = path.resolve(p);
+  const layouts = [path.join(abs, ...AB_TAIL), path.join(abs, 'StreamingAssets', 'AB', 'Windows'), abs];
+  return layouts.find((c) => exists(c)) || abs;
+}
+
+/** Windows: the launcher's own install folder names used for the game ("Arknights" and "Arknights Game"). */
+const WIN_GAME_DIRS = ['Arknights', 'Arknights Game'];
+
 /** Candidate AssetBundle roots for this OS (existence not checked). */
 export function clientCandidates() {
   const home = os.homedir();
@@ -298,14 +354,15 @@ export function clientCandidates() {
   const add = (p, kind) => out.push({ path: p, kind });
   if (IS_WIN) {
     const drives = ['C', 'D', 'E', 'F', 'G', 'H'];
-    const bases = [
-      ['Program Files', 'Hypergryph Launcher', 'games', 'Arknights'],
-      ['Program Files (x86)', 'Hypergryph Launcher', 'games', 'Arknights'],
-      ['Hypergryph Launcher', 'games', 'Arknights'],
-      ['Games', 'Hypergryph Launcher', 'games', 'Arknights'],
-      ['Program Files', 'Hypergryph', 'Arknights'],
-      ['Arknights'],
-    ];
+    const bases = [];
+    for (const g of WIN_GAME_DIRS) bases.push(
+      ['Program Files', 'Hypergryph Launcher', 'games', g],
+      ['Program Files (x86)', 'Hypergryph Launcher', 'games', g],
+      ['Hypergryph Launcher', 'games', g],
+      ['Games', 'Hypergryph Launcher', 'games', g],
+      ['Program Files', 'Hypergryph', g],
+      [g],
+    );
     for (const d of drives) for (const b of bases) add(path.win32.join(`${d}:\\`, ...b, ...AB_TAIL), 'Windows');
   }
   if (IS_MAC) {
@@ -335,16 +392,31 @@ export function inspectClientRoot(dir) {
   return { exists: true, autochess };
 }
 
-/** First installed client (explicit dir first). */
+/** A remembered client root (setup-state.json `clientPath`), set when the user typed the folder (locateClient). */
+function savedClientPath() { return loadState().clientPath || null; }
+
+/**
+ * First installed client, in this order: explicit dir (--game) → SP_ARKNIGHTS_AB → the remembered path → the known
+ * install locations. No drive is scanned: the answer comes from these, or from the user (locateClient asks). Returns a client with `autochess`
+ * when it holds the autochess art, else the first existing root (partial), else null.
+ */
 export function findClient(explicit) {
-  const list = explicit ? [{ path: path.resolve(explicit), kind: '--game' }] : clientCandidates();
-  let partial = null;
-  for (const cand of list) {
-    const info = inspectClientRoot(cand.path);
-    if (info.exists && info.autochess) return { ...cand, ...info };
-    if (info.exists && !partial) partial = { ...cand, ...info };
-  }
-  return partial;
+  const pick = (list) => {
+    let partial = null;
+    for (const cand of list) {
+      const info = inspectClientRoot(cand.path);
+      if (info.exists && info.autochess) return { ...cand, ...info };
+      if (info.exists && !partial) partial = { ...cand, ...info };
+    }
+    return partial;
+  };
+  if (explicit) return pick([{ path: resolveAbRoot(explicit), kind: '--game' }]);
+  const env = process.env.SP_ARKNIGHTS_AB || process.env.SP_ARKNIGHTS_GAME;
+  const saved = savedClientPath();
+  const first = [];
+  if (env) first.push({ path: resolveAbRoot(env), kind: 'SP_ARKNIGHTS_AB' });
+  if (saved) first.push({ path: resolveAbRoot(saved), kind: '已记住的路径' });
+  return pick([...first, ...clientCandidates().map((c) => ({ ...c, path: resolveAbRoot(c.path) }))]);
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -498,7 +570,7 @@ async function main() {
   const state = loadState();
   if (opts.local === 'no') add(local.manifest ? 'ok' : 'skip', '本地客户端美术（可选）', local.manifest ? `已提取 ${local.count} 项` : '已跳过（--no-local）');
   else {
-    const client = findClient(opts.game);
+    const client = await locateClient(opts.game, { yes: opts.yes });
     const already = local.manifest && local.dirPresent;
     if (!client) {
       if (already && local.board3d && !local.tiles && !opts.check) cropBoardTiles(log);
@@ -548,7 +620,7 @@ async function main() {
   // 7. official battlefield scenes (optional; the full zip ships them, a lite / source install may fetch them)
   if (opts.scenes !== 'no') {
     const sceneLocal = checkLocal();
-    const sceneClient = findClient(opts.game);
+    const sceneClient = await locateClient(opts.game, { yes: opts.yes });
     const scenePy = findPython();
     const clientFlag = sceneClient?.autochess ? true : (sceneClient ? 'incomplete' : false);
     let decision = sceneInstallPlan({
