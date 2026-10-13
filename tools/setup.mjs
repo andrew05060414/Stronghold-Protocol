@@ -31,7 +31,12 @@
 //   --local          extract from the local client without asking (re-extracts when already done)
 //   --scenes         download and extract the official battlefield scenes without asking
 //   --no-scenes      do not download or extract battlefield scenes (the metal board stays)
-//   --game <dir>     AssetBundle root of the local client (…/StreamingAssets/AB/Windows or PlayCover …/Documents/Bundles)
+//   --game <dir>     the local client: its install folder (the one holding Arknights.exe), its Arknights_Data folder or
+//                    the AssetBundle root (…/StreamingAssets/AB/Windows, PlayCover …/Documents/Bundles). A folder that
+//                    holds the autochess art is remembered (.cache/setup-state.json clientPath), so it is given once.
+//                    Lookup order without it: SP_ARKNIGHTS_AB → the remembered folder → the usual install locations
+//                    (no drive is scanned). When none has a client, a terminal run asks once for the folder (60 s,
+//                    Enter = skip and stop asking); --check, --quiet, -y and a run without a terminal never ask.
 //   -y, --yes        answer "yes" to every question
 //   --quiet          fewer lines (used by scripts/launch.mjs)
 //   -h, --help
@@ -122,46 +127,52 @@ function saveState(patch) {
   } catch { /* best effort */ }
 }
 
-/** Ask for a free-text answer on a TTY. Non-TTY → null; an empty answer → ''. */
-async function askText(question) {
+/** Ask for a free-text answer on a TTY. Non-TTY, or no answer within `timeoutMs` → null; an empty answer → ''. */
+async function askText(question, timeoutMs = 60000) {
   if (!process.stdin.isTTY || !process.stdout.isTTY) return null;
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
   try {
-    return await new Promise((resolve) => rl.question(`  ${question} `, (a) => resolve(String(a || '').trim().replace(/^["']|["']$/g, ''))));
+    return await new Promise((resolve) => {
+      const t = setTimeout(() => { process.stdout.write(c.dim(`\n  (${timeoutMs / 1000} 秒无输入，本次跳过)\n`)); resolve(null); }, timeoutMs);
+      rl.question(`  ${question} `, (a) => { clearTimeout(t); resolve(String(a || '').trim().replace(/^["']|["']$/g, '')); });
+    });
   } finally {
     rl.close();
   }
 }
 
-let clientLookup = null;
 /**
- * The local client for this run (memoised: steps 6 and 7 share it). When nothing is found and a terminal is
- * attached, ask once for the install folder; the answer is remembered in setup-state.json (`clientPath`), and an
- * empty answer is remembered as `clientDeclined` so setup stops asking (--game still works).
+ * The local client for this run. --game: the given folder, remembered in setup-state.json (`clientPath`) when it
+ * holds the autochess art. Otherwise findClient's order; when that finds no usable client, a terminal run asks once
+ * for the install folder (with askText's timeout): a valid answer is remembered as `clientPath`, an empty one as
+ * `clientDeclined` (setup stops asking; --game still works), no answer in time changes nothing. Never asks with
+ * --check, --quiet (scripts/launch.mjs starts the game through it), --yes or without a terminal, and --check never
+ * writes the state file. `find`, `prompt`, `state`, `tty` and `log` are replaceable for the tests.
  */
-function locateClient(explicit, { yes = false } = {}) {
-  if (!clientLookup) clientLookup = (async () => {
-    const found = findClient(explicit);
-    if (found?.autochess || explicit || yes) return found;
-    if (!process.stdin.isTTY || !process.stdout.isTTY) return found;
-    if (loadState().clientDeclined) return found;
-    console.log(`\n${c.cyan('▶')} 没有找到可用的明日方舟客户端（已查看常见安装位置和上次记住的路径；不扫描磁盘）。`);
-    console.log('  若游戏装在别处，请输入安装目录（里面有 Arknights.exe 的文件夹，例如 D:\\模拟器\\Arknights Game），也可以直接输入 Arknights_Data\\StreamingAssets\\AB\\Windows。');
-    console.log(c.dim('  直接回车跳过；跳过后不再询问，之后可用 --game <目录> 指定，或设置环境变量 SP_ARKNIGHTS_AB。'));
-    const typed = await askText('客户端安装目录：');
-    if (typed === null) return found;
-    if (!typed) { saveState({ clientDeclined: true }); return found; }
-    const root = resolveAbRoot(typed);
-    const info = inspectClientRoot(root);
-    if (info.exists && info.autochess) {
-      saveState({ clientPath: root });
-      console.log(`  ${c.ok('✔')} 已记住：${root}`);
-      return { path: root, kind: '手动输入', ...info };
-    }
-    console.log(`  ${c.warn('!')} ${typed} 里没有找到卫戍协议需要的美术（${info.exists ? '缺少 ui/autochess 或 arts/maps/map_autochess，请在游戏内下载全部资源' : '路径不存在'}）。`);
+export async function locateClient(explicit, o = {}) {
+  const { yes = false, quiet = false, check = false, find = findClient, prompt = askText,
+    state = { load: loadState, save: saveState }, tty = !!(process.stdin.isTTY && process.stdout.isTTY), log = console.log } = o;
+  const found = find(explicit);
+  if (explicit) {
+    if (found?.autochess && !check && state.load().clientPath !== found.path) state.save({ clientPath: found.path, clientDeclined: false });
     return found;
-  })();
-  return clientLookup;
+  }
+  if (found?.autochess || yes || quiet || check || !tty || state.load().clientDeclined) return found;
+  log(`\n${c.cyan('▶')} 没有找到可用的明日方舟客户端（已查看常见安装位置和上次记住的路径；不扫描磁盘）。`);
+  log('  若游戏装在别处，请输入安装目录（里面有 Arknights.exe 的文件夹，例如 D:\\Games\\Arknights Game），也可以直接输入 Arknights_Data\\StreamingAssets\\AB\\Windows。');
+  log(c.dim('  直接回车跳过；跳过后不再询问，之后可用 --game <目录> 指定，或设置环境变量 SP_ARKNIGHTS_AB。'));
+  const typed = await prompt('客户端安装目录：');
+  if (typed === null) return found;
+  if (!typed) { state.save({ clientDeclined: true }); return found; }
+  const root = resolveAbRoot(typed);
+  const info = inspectClientRoot(root);
+  if (info.exists && info.autochess) {
+    state.save({ clientPath: root, clientDeclined: false });
+    log(`  ${c.ok('✔')} 已记住：${root}`);
+    return { path: root, kind: '手动输入', ...info };
+  }
+  log(`  ${c.warn('!')} ${typed} 里没有找到卫戍协议需要的美术（${info.exists ? '缺少 ui/autochess 或 arts/maps/map_autochess，请在游戏内下载全部资源' : '路径不存在'}）。`);
+  return found;
 }
 
 /** Ask a yes/no question on a TTY (default on Enter / timeout = `def`). Non-TTY → null (nobody to ask). */
@@ -392,7 +403,7 @@ export function inspectClientRoot(dir) {
   return { exists: true, autochess };
 }
 
-/** A remembered client root (setup-state.json `clientPath`), set when the user typed the folder (locateClient). */
+/** A remembered client root (setup-state.json `clientPath`), set by --game or by the typed answer (locateClient). */
 function savedClientPath() { return loadState().clientPath || null; }
 
 /**
@@ -500,6 +511,9 @@ async function main() {
   if (opts.help) { console.log(helpText()); return 0; }
   const log = (s = '') => console.log(s);
   const say = (s) => { if (!opts.quiet) log(s); };
+  // steps 6 and 7 share one lookup (and at most one question)
+  let clientLookup = null;
+  const theClient = () => (clientLookup ||= locateClient(opts.game, { yes: opts.yes, quiet: opts.quiet, check: opts.check }));
   const summary = [];
   const add = (state, label, detail = '') => summary.push({ state, label, detail });
   let fatal = false;
@@ -570,7 +584,7 @@ async function main() {
   const state = loadState();
   if (opts.local === 'no') add(local.manifest ? 'ok' : 'skip', '本地客户端美术（可选）', local.manifest ? `已提取 ${local.count} 项` : '已跳过（--no-local）');
   else {
-    const client = await locateClient(opts.game, { yes: opts.yes });
+    const client = await theClient();
     const already = local.manifest && local.dirPresent;
     if (!client) {
       if (already && local.board3d && !local.tiles && !opts.check) cropBoardTiles(log);
@@ -620,7 +634,7 @@ async function main() {
   // 7. official battlefield scenes (optional; the full zip ships them, a lite / source install may fetch them)
   if (opts.scenes !== 'no') {
     const sceneLocal = checkLocal();
-    const sceneClient = await locateClient(opts.game, { yes: opts.yes });
+    const sceneClient = await theClient();
     const scenePy = findPython();
     const clientFlag = sceneClient?.autochess ? true : (sceneClient ? 'incomplete' : false);
     let decision = sceneInstallPlan({
